@@ -157,6 +157,10 @@ def process(compress, length, vocab_size, coder, data):
     """
     start = time.time()
     
+    torch.manual_seed(1234)
+    random.seed(1234)
+    np.random.seed(1234)
+    
     # Создание модели
     model = GRUCompress(vocab_size, embed_size, hidden_size, num_layers).to(device)
     model.eval()  # Устанавливаем режим оценки
