@@ -10,21 +10,18 @@ import hashlib
 
 from ArithmeticCoder import ArithmeticEncoder, ArithmeticDecoder, BitOutputStream, BitInputStream
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# The batch size for training
-batch_size = 256
-# The sequence length for training
-seq_length = 15
-# The number of units in each GRU layer
-hidden_size = 400
-# The number of GRU layers
-num_layers = 4
-# The size of the embedding layer
-embed_size = 1024
-# The initial learning rate for optimizer
-learning_rate = 0.0005
 
-# The mode for the program, "compress", "decompress", "both"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Гиперпараметры
+batch_size = 256        # Размер батча
+seq_length = 15         # Длина последовательности для обучения
+hidden_size = 400       # Размер скрытого слоя GRU
+num_layers = 4          # Количество слоёв GRU
+embed_size = 1024       # Размер слоя эмбеддингов
+learning_rate = 0.0005  # Начальная скорость обучения
+
+# Режим программы: "compress", "decompress", или "both"
 mode = 'both'
 
 path_to_file = "data/enwik5"
@@ -43,100 +40,74 @@ class GRUCompress(nn.Module):
         embeds = self.embedding(x)  # (batch_size, seq_length, embed_dim)
         _, h_n = self.gru(embeds)  # h_n: (num_layers, batch_size, hidden_size)
         h_n = h_n.transpose(0, 1).reshape(batch_size, num_layers * hidden_size)  # (batch_size, num_layers * hidden_size)
+        # Предсказываем логиты следующего символа
         logits = self.fc(h_n)  # (batch_size, vocab_size)
         return logits
-    
+
 
 def get_symbol(index, length, freq, coder, compress, data):
-    """Runs arithmetic coding and returns the next symbol.
-
-    Args:
-        index: Int, position of the symbol in the file.
-        length: Int, size limit of the file.
-        freq: ndarray, predicted symbol probabilities.
-        coder: this is the arithmetic coder.
-        compress: Boolean, True if compressing, False if decompressing.
-        data: List containing each symbol in the file.
-
-    Returns:
-        The next symbol, or 0 if "index" is over the file size limit.
-    """
+    """Возвращает следующий символ с использованием арифметического кодирования."""
     symbol = 0
     if index < length:
         if compress:
+            # При сжатии записываем символ в кодировщик
             symbol = data[index]
             coder.write(freq, symbol)
         else:
+            # При декомпрессии считываем символ из декодера
             symbol = coder.read(freq)
             data[index] = symbol
     return symbol
 
 
+# Обучающий шаг
 def train(pos, seq_input, length, vocab_size, coder, model, optimizer, compress, data):
-    """Runs one training step.
-
-    Args:
-        pos: Int, position in the file for the current symbol for the *first* batch.
-        seq_input: Tensor, containing the last seq_length inputs for the model.
-        length: Int, size limit of the file.
-        vocab_size: Int, size of the vocabulary.
-        coder: this is the arithmetic coder.
-        model: the model to generate predictions.
-        optimizer: optimizer used to train the model.
-        compress: Boolean, True if compressing, False if decompressing.
-        data: List containing each symbol in the file.
-
-    Returns:
-        seq_input: Tensor, containing the last seq_length inputs for the model.
-        cross_entropy: cross entropy numerator.
-        denom: cross entropy denominator.
-    """
+    """Выполняет одну итерацию обучения или декодирования."""
     loss = 0
     cross_entropy = 0
     denom = 0
     split = math.ceil(length / batch_size)
 
-    model.train()  # Устанавливаем режим тренировки
-    optimizer.zero_grad()  # Обнуляем градиенты
+    model.train()
+    optimizer.zero_grad()
 
-    seq_input = seq_input.to(device)  # Перевод на GPU/CPU
+    seq_input = seq_input.to(device)
 
-    # Forward pass
-    logits = model(seq_input)  # Получаем логиты (batch_size, vocab_size)
-    probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+    logits = model(seq_input)  # Логиты (batch_size, vocab_size)
+    probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()  # Преобразуем в вероятности
 
-    symbols = []
-    mask = []
+    symbols = []  # Хранение таргетных символов
+    mask = []     # Маска для обработки случая, когда батч может быть неполностью заполнен
 
-    # Актуализируем вероятности и маски
+    # Предсказываем символы
     for i in range(batch_size):
-        freq = np.cumsum(probs[i] * 10000000 + 1)
+        freq = np.cumsum(probs[i] * 10000000 + 1)  # Частоты для арифметического кодера
         index = pos + i * split
         symbol = get_symbol(index, length, freq, coder, compress, data)
         symbols.append(symbol)
 
         if index < length:
-            prob = probs[i][symbol]
+            prob = probs[i][symbol]  # Вероятность символа
             if prob <= 0:
-                prob = 1e-6  # Избегаем ошибки с log
-            cross_entropy += math.log2(prob)
+                prob = 1e-6  # Избегаем log(0)
+            cross_entropy += math.log2(prob)  # Суммируем кросс-энтропию
             denom += 1
             mask.append(1.0)
         else:
             mask.append(0.0)
 
-    # Преобразование символов в one-hot вектор
+    # Преобразуем таргетные символы в one-hot
     symbols = torch.tensor(symbols, device=device)
     input_one_hot = torch.nn.functional.one_hot(symbols, vocab_size).float()
 
-    # Loss calculation
+    # Лосс
     loss = torch.nn.functional.cross_entropy(logits, input_one_hot, reduction='none')
     loss = loss * torch.tensor(mask, device=device).unsqueeze(1)  # Применяем маску
     loss = loss.mean()  # Среднее значение лосса
 
-    # Backward pass and optimization
+    # Обратное распространение
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 4)  # Ограничиваем градиенты
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 4)  # Ограничение градиентов
     optimizer.step()
 
     # Обновляем входную последовательность
@@ -144,47 +115,39 @@ def train(pos, seq_input, length, vocab_size, coder, model, optimizer, compress,
 
     return seq_input, cross_entropy, denom
 
-
+# Основной процесс сжатия/декомпрессии
 def process(compress, length, vocab_size, coder, data):
-    """Runs compression/decompression.
-
-    Args:
-        compress: Boolean, True if compressing, False if decompressing.
-        length: Int, size limit of the file.
-        vocab_size: Int, size of the vocabulary.
-        coder: this is the arithmetic coder.
-        data: List containing each symbol in the file.
-    """
+    """Выполняет сжатие или декомпрессию."""
     start = time.time()
     
     torch.manual_seed(1234)
     random.seed(1234)
     np.random.seed(1234)
-    
-    # Создание модели
-    model = GRUCompress(vocab_size, embed_size, hidden_size, num_layers).to(device)
-    model.eval()  # Устанавливаем режим оценки
 
-    # Инициализация оптимизатора и лосса
+    # Модель
+    model = GRUCompress(vocab_size, embed_size, hidden_size, num_layers).to(device)
+    model.eval()
+    
     optimizer = torch.optim.Adam(model.parameters(), learning_rate)
 
-    # Подготовка первого батча символов
+    # Задаем первичное равномерное распределение вероятностей для автокодировщика для начальных символов
     freq = np.cumsum(np.full(vocab_size, 1.0 / vocab_size) * 10000000 + 1)
     symbols = []
     for i in range(batch_size):
         symbols.append(get_symbol(i * (length // batch_size), length, freq, coder, compress, data))
-    
+
+    # Начальные токены копируем на всю последовательность
     seq_input = torch.tensor(symbols, device=device).unsqueeze(1).repeat(1, seq_length)
 
-    pos = 0
+    pos = 0 # Номер текущего батча
     cross_entropy = 0
-    denom = 0
+    denom = 0 # Счётчик количества символов, для которых была рассчитана кросс-энтропия
 
-    split = math.ceil(length / batch_size)
+    split = math.ceil(length / batch_size)  # Кол-во батчей
     template = '{:0.2f}%\tcross entropy: {:0.2f}\ttime: {:0.2f}'
-    
+
+    # Основной цикл обучения
     while pos < split:
-        # Тренировочный/инференс шаг
         seq_input, ce, d = train(pos, seq_input, length, vocab_size, coder, model, optimizer, compress, data)
         cross_entropy += ce
         denom += d
@@ -193,86 +156,97 @@ def process(compress, length, vocab_size, coder, data):
         if pos % 5 == 0:
             percentage = 100 * pos / split
             print(template.format(percentage, -cross_entropy / denom, time.time() - start))
-    
+
     if compress:
         coder.finish()
-    
-    print(template.format(100, -cross_entropy / length, time.time() - start))
-    
-    
-def compession():
-    # int_list will contain the characters of the file.
-    int_list = []
-    text = open(path_to_file, 'rb').read()
-    vocab = sorted(set(text))
-    vocab_size = len(vocab)
-    # Creating a mapping from unique characters to indexes.
-    char2idx = {u: i for i, u in enumerate(vocab)}
-    for _ , c in enumerate(text):
-        int_list.append(char2idx[c])
 
-    # Round up to a multiple of 8 to improve performance.
-    vocab_size = math.ceil(vocab_size/8) * 8
-    file_len = len(int_list)
+    print(template.format(100, -cross_entropy / length, time.time() - start))
+
+
+def compession():
+    """Сжимает данные из исходного файла и сохраняет результат в файл .dat."""
+    int_list = [] # Список для хранения символов из файла
+    text = open(path_to_file, 'rb').read()  # Читаем файл в бинарном формате
+    vocab = sorted(set(text))  # Формируем уникальный словарь символов
+    vocab_size = len(vocab)  # Размер словаря
+
+    # Создаём отображение символ -> индекс
+    char2idx = {u: i for i, u in enumerate(vocab)}
+    for _, c in enumerate(text):
+        int_list.append(char2idx[c])  # Преобразуем каждый символ в его индекс
+
+    # Округляем размер словаря до ближайшего числа, кратного 8, для оптимизации
+    vocab_size = math.ceil(vocab_size / 8) * 8
+    file_len = len(int_list)  # Количество символов в файле
     print('Length of file: {} symbols'.format(file_len))
     print('Vocabulary size: {}'.format(vocab_size))
 
     with open(path_to_compressed, "wb") as out, contextlib.closing(BitOutputStream(out)) as bitout:
+        # Записываем длину исходного файла в заголовок сжатого файла
         length = len(int_list)
-        # Write the original file length to the compressed file header.
         out.write(length.to_bytes(5, byteorder='big', signed=False))
-        # Write 256 bits to the compressed file header to keep track of the vocabulary.
+        
+        # Записываем информацию о словаре в заголовок файла (256 бит для каждого символа)
         for i in range(256):
             if i in char2idx:
                 bitout.write(1)
             else:
                 bitout.write(0)
-        enc = ArithmeticEncoder(32, bitout)
-        process(True, length, vocab_size, enc, int_list)
-        
-        
-def decompression():
-    with open(path_to_compressed, "rb") as inp, open(path_to_decompressed, "wb") as out:
-        # Read the original file size from the header.
-        length = int.from_bytes(inp.read()[:5], byteorder='big')
-        inp.seek(5)
-        # Create a list to store the file characters.
-        output = [0] * length
-        bitin = BitInputStream(inp)
 
-        # Get the vocabulary from the file header.
+        # Инициализируем арифметический кодировщик
+        enc = ArithmeticEncoder(32, bitout)
+        process(True, length, vocab_size, enc, int_list)  # Запускаем процесс сжатия
+
+
+def decompression():
+    """Декомпрессирует данные из сжатого файла и сохраняет результат в новый файл."""
+    with open(path_to_compressed, "rb") as inp, open(path_to_decompressed, "wb") as out:
+        # Считываем длину исходного файла из заголовка
+        length = int.from_bytes(inp.read()[:5], byteorder='big')
+        inp.seek(5)  # Пропускаем байты, содержащие длину
+
+        # Инициализируем список для хранения декодированных символов
+        output = [0] * length
+        bitin = BitInputStream(inp)  # Поток для чтения побитово
+
+        # Считываем словарь из заголовка файла
         vocab = []
         for i in range(256):
             if bitin.read():
                 vocab.append(i)
         vocab_size = len(vocab)
-        # Round up to a multiple of 8 to improve performance.
-        vocab_size = math.ceil(vocab_size/8) * 8
+        
+        # Округляем размер словаря до ближайшего числа, кратного 8
+        vocab_size = math.ceil(vocab_size / 8) * 8
+        
+        # Инициализируем арифметический декодер
         dec = ArithmeticDecoder(32, bitin)
-        process(False, length, vocab_size, dec, output)
-        # The decompressed data is stored in the "output" list. We can now write the
-        # data to file (based on the type of preprocessing used).
+        process(False, length, vocab_size, dec, output)  # Запускаем процесс декомпрессии
 
-        # Convert indexes back to the original characters.
+        # Преобразуем индексы обратно в символы и записываем в выходной файл
         idx2char = np.array(vocab)
         for i in range(length):
             out.write(bytes((idx2char[output[i]],)))
-            
+
 
 def main():
+    """Основная функция, управляющая процессами сжатия и декомпрессии."""
     start = time.time()
     if mode == 'compress' or mode == 'both':
+        # Выполняем сжатие
         compession()
         print(f"Original size: {os.path.getsize(path_to_file)} bytes")
         print(f"Compressed size: {os.path.getsize(path_to_compressed)} bytes")
-        print("Compression ratio:", os.path.getsize(path_to_file)/os.path.getsize(path_to_compressed))
+        print("Compression ratio:", os.path.getsize(path_to_file) / os.path.getsize(path_to_compressed))
     if mode == 'decompress' or mode == 'both':
+        # Выполняем декомпрессию
         decompression()
+        # Проверяем совпадение хэшей исходного и восстановленного файлов
         hash_dec = hashlib.md5(open(path_to_decompressed, 'rb').read()).hexdigest()
         hash_orig = hashlib.md5(open(path_to_file, 'rb').read()).hexdigest()
-        assert hash_dec == hash_orig
+        assert hash_dec == hash_orig, "Восстановленный файл не совпадает с оригиналом!"
     print("Time spent: ", time.time() - start)
-    
-    
+
+
 if __name__ == '__main__':
     main()
